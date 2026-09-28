@@ -1,0 +1,61 @@
+<?xml version="1.0"?>
+<!--
+  RMUL 2026 3V3 field adapted from ROS2_RM_Navigation/pb_rm_simulation.
+  Copyright (c) 2026 MY_nav Contributors. Licensed under the MIT License.
+-->
+<sdf version="1.7">
+  <world name="default">
+    <plugin filename="libRecruitmentSimRefereeSimulation.so" name="recruitment_sim::RefereeSimulation"/>
+
+    <gravity>0 0 -9.8</gravity>
+    <physics type="ode">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1</real_time_factor>
+      <real_time_update_rate>1000</real_time_update_rate>
+    </physics>
+    <scene>
+      <!-- Keep total illumination below saturation so field material colors
+           remain visible in Classic Ogre instead of being clipped to white. -->
+      <ambient>0.28 0.28 0.28 1</ambient>
+      <background>0.7 0.7 0.7 1</background>
+      <!-- Disable real-time shadow-map rendering. Four robot cameras render
+           independent views, so shadows otherwise multiply the GPU cost. -->
+      <shadows>false</shadows>
+      <grid>false</grid>
+    </scene>
+
+    <!-- 场地模型 RMUL_2026 自带完整碰撞网格（RMUL_2026H.stl，含地面），
+         机器人实际踩在它上面，因此这里不再保留 100x100 的通用 ground_plane。
+         实测：删掉它后机器人静止高度与行驶位移完全不变。 -->
+
+    <include>
+      <uri>model://RMUL2026H_world</uri>
+      <name>RMUL_2026</name>
+      <pose>0 0 0.001 0 0 0</pose>
+    </include>
+
+    <!-- A vertical directional light gives the whole field uniform,
+         rotation-symmetric illumination without washing out its colors. -->
+    <light name="field_directional_light" type="directional">
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.82 0.82 0.82 1</diffuse>
+      <specular>0.06 0.06 0.06 1</specular>
+      <direction>0 0 -1</direction>
+      <attenuation>
+        <range>50</range>
+        <constant>0.5</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <cast_shadows>false</cast_shadows>
+    </light>
+
+    <gui fullscreen="false">
+      <camera name="user_camera">
+        <pose>7.46312 3.78907 13.2486 0 1.5698 1.56647</pose>
+        <view_controller>orbit</view_controller>
+        <projection_type>perspective</projection_type>
+      </camera>
+    </gui>
+  </world>
+</sdf>

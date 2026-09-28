@@ -1,0 +1,7 @@
+/.vscode/
+/build/
+/install/
+/log/
+__pycache__/
+.pytest_cache/
+src/recruitment_sim_env/recruitment_sim_player_web/frontend/node_modules/

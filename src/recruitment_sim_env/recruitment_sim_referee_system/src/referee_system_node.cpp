@@ -1,0 +1,447 @@
+#include "recruitment_sim_referee_system/match_engine.hpp"
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <deque>
+#include <iomanip>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <sstream>
+#include <stdexcept>
+#include <rclcpp/rclcpp.hpp>
+#include <recruitment_sim_interfaces/msg/simulation_frame.hpp>
+#include <recruitment_sim_interfaces/srv/control_simulation.hpp>
+#include "recruitment_sim_interfaces/msg/robot_status.hpp"
+#include "recruitment_sim_interfaces/msg/match_status.hpp"
+#include "recruitment_sim_interfaces/msg/match_info.hpp"
+#include "recruitment_sim_interfaces/srv/set_robot_enabled.hpp"
+#include "recruitment_sim_interfaces/srv/reset_robot.hpp"
+#include "recruitment_sim_interfaces/srv/control_match.hpp"
+#include "recruitment_sim_interfaces/srv/initialize_module.hpp"
+
+namespace recruitment_sim_referee_system
+{
+using SimulationFrame = recruitment_sim_interfaces::msg::SimulationFrame;
+using SimulationControl = recruitment_sim_interfaces::srv::ControlSimulation;
+using Enable = recruitment_sim_interfaces::srv::SetRobotEnabled;
+using Reset = recruitment_sim_interfaces::srv::ResetRobot;
+using Initialize = recruitment_sim_interfaces::srv::InitializeModule;
+using Control = recruitment_sim_interfaces::srv::ControlMatch;
+using Status = recruitment_sim_interfaces::msg::MatchStatus;
+using Info = recruitment_sim_interfaces::msg::MatchInfo;
+using RobotStatus = recruitment_sim_interfaces::msg::RobotStatus;
+class RefereeSystemNode : public rclcpp::Node
+{
+public:
+  RefereeSystemNode() : Node("referee_system")
+  {
+    const auto names = declare_parameter("robot_names", std::vector<std::string>{});
+    const auto teams = declare_parameter("robot_teams", std::vector<std::string>{});
+    const auto hp = declare_parameter("robot_max_hps", std::vector<int64_t>{});
+    const auto heat = declare_parameter("robot_heat_limits", std::vector<double>{});
+    const auto cool = declare_parameter("robot_cooling_rates", std::vector<double>{});
+    robot_names_ = names;
+    const auto bounds = declare_parameter("zone_bounds", std::vector<double>{-1.5, 1.5, -1.5, 1.5});
+    const bool zone = declare_parameter("zone_enabled", true);
+    // 启动/补给区取场地里 1.5 x 2.0 m 的启动区兼补给区；入场后进己方补给区解除"虚弱"并回血。
+    const auto red_supply = declare_parameter(
+      "red_supply_zone", std::vector<double>{-6.0, -4.5, 2.0, 4.0});
+    const auto blue_supply = declare_parameter(
+      "blue_supply_zone", std::vector<double>{4.5, 6.0, -4.0, -2.0});
+    const bool supply = declare_parameter("supply_zone_enabled", true);
+    if (names.empty() || teams.size() != names.size() || hp.size() != names.size() ||
+      heat.size() != names.size() || cool.size() != names.size() ||
+      bounds.size() != 4) {throw std::runtime_error("invalid referee configuration arrays");}
+    if (red_supply.size() != 4 || blue_supply.size() != 4) {
+      throw std::runtime_error("supply zone bounds must have 4 elements");
+    }
+    std::vector<RobotConfig> configs;
+    auto qos = rclcpp::QoS(10).reliable().transient_local();
+    const std::map<std::string, uint8_t> color_values{
+      {"none", Reset::Request::NONE},
+      {"red", Reset::Request::RED},
+      {"blue", Reset::Request::BLUE},
+      {"yellow", Reset::Request::YELLOW},
+      {"white", Reset::Request::WHITE},
+    };
+    for (size_t i = 0; i < names.size(); ++i) {
+      const auto color = color_values.find(teams[i]);
+      if (color == color_values.end()) {
+        throw std::runtime_error("unsupported robot color: " + teams[i]);
+      }
+      configs.push_back({names[i], teams[i], static_cast<int>(hp[i]), heat[i], cool[i]});
+      colors_[names[i]] = color->second;
+      publishers_[names[i]] = create_publisher<RobotStatus>("/referee_system/" + names[i] + "/status", qos);
+      enables_[names[i]] = create_client<Enable>("/referee_system/" + names[i] + "/set_enabled");
+      resets_[names[i]] = create_client<Reset>("/referee_system/" + names[i] + "/reset");
+      odometry_initializers_[names[i]] = create_client<Initialize>(
+        "/referee_system/" + names[i] + "/initialize_odometry");
+    }
+    match_ = std::make_unique<MatchEngine>(
+      configs, ZoneConfig{zone, bounds[0], bounds[1], bounds[2], bounds[3]},
+      SupplyConfig{
+        supply,
+        red_supply[0], red_supply[1], red_supply[2], red_supply[3],
+        blue_supply[0], blue_supply[1], blue_supply[2], blue_supply[3]});
+    info_publisher_ = create_publisher<Info>("/referee_system/match/info", qos);
+    status_publisher_ = create_publisher<Status>("/referee_system/match/status", qos);
+    service_ = create_service<Control>("/referee_system/match/control",
+      [this](const std::shared_ptr<Control::Request> req, std::shared_ptr<Control::Response> res) {
+        if (req->command == Control::Request::START) {
+          if (stage_ != Stage::IDLE || !match_->start(last_stamp_)) {
+            res->message = "match is not READY";
+          }
+          else {
+            res->accepted = true; res->message = "match started";
+          }
+        } else if (req->command == Control::Request::END) {
+          res->accepted = true; res->message = "end accepted";
+          if (match_->state() != MatchEngine::FINISHED && match_->state() != MatchEngine::ENDING) {
+            match_->end(); begin_end();
+          }
+        } else if (req->command == Control::Request::RESUME) {
+          if (!match_->reset(++serial_)) {
+            res->message = "reset is only allowed in TRAINING, FINISHED, or ERROR";
+          } else {
+            new_operation();
+            if (!configured_) {simulation("CONFIG", Stage::CONFIG);}
+            else {begin_base(false, Stage::START_STOP);}
+            res->accepted = true; res->message = "reset and resume accepted; wait for READY";
+          }
+        } else {res->message = "unknown match command";}
+        publish();
+      });
+    simulation_client_ = create_client<SimulationControl>("/referee_system/simulation/control");
+    frame_sub_ = create_subscription<SimulationFrame>("/referee_system/simulation/frame", rclcpp::QoS(2000).reliable(),
+      [this](SimulationFrame::SharedPtr msg) {receive(*msg);});
+    serial_ = static_cast<uint64_t>(steady());
+    simulation("CONFIG", Stage::CONFIG);
+    timer_ = create_wall_timer(std::chrono::milliseconds(10), [this] {tick();});
+    status_timer_ = create_wall_timer(std::chrono::milliseconds(100), [this] {publish();});
+    RCLCPP_INFO(get_logger(), "referee training mode, %zu robots; RESUME resets and START begins judging", names.size());
+  }
+private:
+  enum class Stage {
+    CONFIG, IDLE, START_STOP, START_PAUSE, RESET, INITIALIZE, ENABLE, RESUME,
+    END_STOP, END_PAUSE
+  };
+  struct Frame {
+    MatchFrame game;
+    bool paused{true}, ready{false};
+    uint64_t token{0};
+    std::string phase, error;
+  };
+  struct Pending {
+    bool acknowledged{false}, in_flight{false}, failed{false};
+    int64_t sent{0}, id{0};
+  };
+  struct Desired : Pending {bool value{false};};
+  static int64_t steady() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+  void receive(const SimulationFrame & message)
+  {
+    if (frames_.size() >= 20000) {overflow_ = true; return;}
+    frames_.push_back(message);
+  }
+  bool parse(const SimulationFrame & message, Frame & f)
+  {
+    f.game.round = message.round_id; f.game.stamp = message.stamp_ns;
+    f.paused = message.paused; f.token = message.token; f.phase = message.phase;
+    f.ready = message.ready; f.error = message.error;
+    for (const auto & p : message.positions) {
+      if (!std::isfinite(p.x) || !std::isfinite(p.y)) return false;
+      f.game.positions.push_back({p.name,p.x,p.y});
+    }
+    for (const auto & e : message.events) {
+      if (e.kind == e.SHOT) {
+        ShotEvent shot; shot.stamp_ns=f.game.stamp; shot.projectile_type="17mm";
+        shot.shooter=e.shooter; shot.projectile_id=e.projectile_id; f.game.shots.push_back(shot);
+      } else if (e.kind == e.HIT) {
+        HitEvent hit; hit.stamp_ns=f.game.stamp; hit.shooter=e.shooter; hit.projectile_id=e.projectile_id;
+        hit.target=e.target; hit.target_link=e.target_link; hit.target_collision=e.target_collision;
+        f.game.hits.push_back(hit);
+      } else return false;
+    }
+    return true;
+  }
+  void new_operation()
+  {
+    control_epoch_ = ++serial_;
+    for (auto & p : pending_) {if (p.second.in_flight) {resets_.at(p.first)->remove_pending_request(p.second.id);}}
+    for (auto & p : initialize_pending_) {if (p.second.in_flight) {
+        odometry_initializers_.at(p.first)->remove_pending_request(p.second.id);
+      }}
+    for (auto & p : desired_) {if (p.second.in_flight) {enables_.at(p.first.first)->remove_pending_request(p.second.id);}}
+    pending_.clear(); initialize_pending_.clear(); desired_.clear();
+    match_->referee().take_control_commands();
+  }
+  void begin_base(bool enabled, Stage stage)
+  {
+    stage_ = stage; base_value_ = enabled; stage_since_ = steady();
+    pending_.clear(); initialize_pending_.clear();
+    for (const auto & client : resets_) {pending_[client.first] = Pending{};}
+  }
+  void begin_initialize()
+  {
+    stage_ = Stage::INITIALIZE; stage_since_ = steady(); initialize_pending_.clear();
+    for (const auto & client : odometry_initializers_) {
+      initialize_pending_[client.first] = Pending{};
+    }
+  }
+  void simulation(const std::string & verb, Stage stage)
+  {
+    stage_ = stage; stage_since_ = steady(); token_ = ++serial_; last_send_ = 0;
+    simulation_command_ = std::make_shared<SimulationControl::Request>();
+    simulation_command_->token=token_; simulation_command_->round_id=match_->round();
+    simulation_command_->robot_names=robot_names_;
+    const std::map<std::string,uint8_t> operations{{"CONFIG",0},{"PAUSE",1},{"RESET",2},{"RESUME",3}};
+    simulation_command_->operation=operations.at(verb);
+  }
+  void send_simulation(const SimulationControl::Request::SharedPtr & req)
+  {
+    if (!simulation_client_->service_is_ready()) return;
+    // Completion is acknowledged by a frame with the same token. Retire the
+    // previous service future so repeated retries cannot accumulate requests.
+    if (simulation_request_id_) simulation_client_->remove_pending_request(simulation_request_id_);
+    simulation_request_id_ = simulation_client_->async_send_request(req,
+      [](rclcpp::Client<SimulationControl>::SharedFuture) {}).request_id;
+  }
+  void begin_end()
+  {
+    new_operation(); begin_base(false, Stage::END_STOP); publish();
+  }
+  void fail(const std::string & message)
+  {
+    match_->fail(message); new_operation(); stage_ = Stage::IDLE;
+    // Best effort fail-safe only: ERROR never claims pause/disable succeeded.
+    for (const auto & c : resets_) {
+      auto req = std::make_shared<Reset::Request>();
+      req->round_id = control_epoch_; req->enabled = false;
+      req->color = colors_.at(c.first);
+      if (c.second->service_is_ready()) {c.second->async_send_request(req,
+        [](rclcpp::Client<Reset>::SharedFuture) {});}
+    }
+    auto req = std::make_shared<SimulationControl::Request>();
+    req->token=++serial_; req->round_id=match_->round(); req->operation=req->PAUSE;
+    send_simulation(req);
+    RCLCPP_ERROR(get_logger(), "%s", message.c_str()); publish();
+  }
+  void tick()
+  {
+    std::deque<SimulationFrame> frames; bool overflow;
+    {std::lock_guard<std::mutex> lock(mutex_); frames.swap(frames_); overflow = overflow_; overflow_ = false;}
+    if (overflow) {fail("simulation frame queue overflow; match invalid"); return;}
+    for (const auto & text : frames) {
+      Frame frame; if (!parse(text, frame)) {fail("malformed simulation frame"); return;}
+      last_frame_wall_ = steady();
+      last_stamp_ = frame.game.stamp;
+      if (frame.token == token_) {
+        if (!frame.error.empty()) {fail(frame.error); return;}
+        if (stage_ == Stage::CONFIG && frame.ready) {
+          configured_ = true; stage_ = Stage::IDLE;
+          if (match_->state() == MatchEngine::RESETTING) {begin_base(false, Stage::START_STOP);}
+        }
+        else if (stage_ == Stage::START_PAUSE && frame.paused) {simulation("RESET", Stage::RESET);}
+        else if (stage_ == Stage::RESET && frame.ready && frame.phase == "READY" &&
+          frame.game.round == match_->round()) {begin_initialize();}
+        else if (stage_ == Stage::RESUME && !frame.paused && frame.ready) {
+          match_->reset_complete();
+          if (match_->state() != MatchEngine::READY) {fail("match left RESETTING while resuming"); return;}
+          stage_ = Stage::IDLE; publish();
+        } else if (stage_ == Stage::END_PAUSE && frame.paused) {
+          match_->paused(); stage_ = Stage::IDLE; publish();
+        }
+      }
+      if (!frame.paused) {
+        const auto before = match_->state();
+        match_->process(frame.game);
+        if (before == MatchEngine::RUNNING && match_->state() == MatchEngine::ENDING) {begin_end();}
+      }
+    }
+    // The first CONFIG waits for gzserver to finish loading the world and for
+    // the WorldPlugin to appear, which can comfortably exceed a user-initiated
+    // operation on a cold Classic start. Later stages keep the short limit.
+    const bool configuring = stage_ == Stage::CONFIG;
+    const auto limit = configuring ? 60000000000LL : 10000000000LL;
+    if (stage_ != Stage::IDLE && steady() - stage_since_ > limit) {
+      fail("lifecycle stage " + std::to_string(static_cast<int>(stage_)) + " timed out (" +
+        std::to_string(limit / 1000000000LL) + " s)"); return;
+    }
+    if (match_->state() == MatchEngine::RUNNING && last_frame_wall_ &&
+      steady() - last_frame_wall_ > 10000000000LL) {fail("simulation heartbeat lost"); return;}
+    if (stage_ == Stage::INITIALIZE) {
+      dispatch_initialize();
+      for (const auto & p : initialize_pending_) {
+        if (p.second.failed) {
+          fail("odometry initialization failed for " + p.first);
+          return;
+        }
+      }
+      bool done = true;
+      for (const auto & p : initialize_pending_) {done = done && p.second.acknowledged;}
+      if (done) {begin_base(true, Stage::ENABLE);}
+    } else if (stage_ == Stage::START_STOP || stage_ == Stage::ENABLE || stage_ == Stage::END_STOP) {
+      dispatch_reset();
+      bool done = true;
+      for (const auto & p : pending_) {done = done && p.second.acknowledged;}
+      if (done) {
+        if (stage_ == Stage::START_STOP) {simulation("PAUSE", Stage::START_PAUSE);}
+        else if (stage_ == Stage::ENABLE) {simulation("RESUME", Stage::RESUME);}
+        else {simulation("PAUSE", Stage::END_PAUSE);}
+      }
+    } else if (stage_ != Stage::IDLE && steady() - last_send_ >= 1000000000LL) {
+      last_send_ = steady(); send_simulation(simulation_command_);
+    }
+    if (stage_ == Stage::IDLE &&
+      (match_->state() == MatchEngine::TRAINING || match_->state() == MatchEngine::READY ||
+      match_->state() == MatchEngine::RUNNING)) {
+      for (const auto & command : match_->referee().take_control_commands()) {
+        const auto key = std::make_pair(command.robot_name, static_cast<uint8_t>(command.target));
+        auto & d = desired_[key];
+        if (d.value != command.enabled || !d.acknowledged) {
+          d.value = command.enabled; d.acknowledged = false;
+        }
+      }
+      dispatch_enable();
+    }
+  }
+  void dispatch_reset()
+  {
+    for (auto & p : pending_) {
+      auto client = resets_.at(p.first); auto & pending = p.second;
+      if (pending.acknowledged || steady() - pending.sent < 1000000000LL) {continue;}
+      if (pending.in_flight) {client->remove_pending_request(pending.id); pending.in_flight = false;}
+      if (!client->service_is_ready()) {continue;}
+      auto req = std::make_shared<Reset::Request>();
+      req->round_id = control_epoch_; req->enabled = base_value_;
+      req->color = colors_.at(p.first);
+      const auto epoch = control_epoch_; const auto stage = stage_; const auto name = p.first;
+      pending.sent = steady(); pending.in_flight = true;
+      pending.id = client->async_send_request(req,
+        [this, epoch, stage, name](rclcpp::Client<Reset>::SharedFuture future) {
+          if (epoch != control_epoch_ || stage != stage_) {return;}
+          auto & p = pending_.at(name); p.in_flight = false;
+          try {p.acknowledged = future.get()->success;} catch (const std::exception &) {}
+        }).request_id;
+    }
+  }
+  void dispatch_initialize()
+  {
+    for (auto & p : initialize_pending_) {
+      auto client = odometry_initializers_.at(p.first); auto & pending = p.second;
+      if (pending.acknowledged || pending.failed || steady() - pending.sent < 1000000000LL) {
+        continue;
+      }
+      if (pending.in_flight) {
+        client->remove_pending_request(pending.id);
+        pending.in_flight = false;
+      }
+      if (!client->service_is_ready()) {continue;}
+      auto req = std::make_shared<Initialize::Request>();
+      req->round_id = control_epoch_;
+      const auto epoch = control_epoch_; const auto name = p.first;
+      pending.sent = steady(); pending.in_flight = true;
+      pending.id = client->async_send_request(req,
+        [this, epoch, name](rclcpp::Client<Initialize>::SharedFuture future) {
+          if (epoch != control_epoch_ || stage_ != Stage::INITIALIZE ||
+            !initialize_pending_.count(name)) {return;}
+          auto & p = initialize_pending_.at(name); p.in_flight = false;
+          try {
+            const auto response = future.get();
+            p.acknowledged = response->success;
+            p.failed = !response->success;
+          } catch (const std::exception &) {
+            p.failed = true;
+          }
+        }).request_id;
+    }
+  }
+  void dispatch_enable()
+  {
+    for (auto & item : desired_) {
+      auto & d = item.second; auto client = enables_.at(item.first.first);
+      if (d.acknowledged || steady() - d.sent < 1000000000LL) {continue;}
+      if (d.in_flight) {client->remove_pending_request(d.id); d.in_flight = false;}
+      if (!client->service_is_ready()) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "waiting for base enable service");
+        continue;
+      }
+      auto req = std::make_shared<Enable::Request>();
+      req->target = item.first.second; req->enabled = d.value; req->round_id = control_epoch_;
+      auto key = item.first; auto epoch = control_epoch_; bool value = d.value;
+      d.sent = steady(); d.in_flight = true;
+      d.id = client->async_send_request(req,
+        [this, key, epoch, value](rclcpp::Client<Enable>::SharedFuture future) {
+          if (epoch != control_epoch_ || !desired_.count(key)) {return;}
+          auto & d = desired_.at(key); d.in_flight = false;
+          try {d.acknowledged = future.get()->success && d.value == value;} catch (const std::exception &) {}
+        }).request_id;
+    }
+  }
+  void publish()
+  {
+    Info s; s.header.stamp = now(); s.state = match_->state();
+    s.elapsed_seconds = match_->elapsed();
+    s.remaining_seconds = std::max(0.0, MatchEngine::kDurationSeconds - s.elapsed_seconds);
+    s.red_victory_points = match_->points()[0]; s.blue_victory_points = match_->points()[1];
+    auto d = match_->damage(); auto h = match_->hp();
+    s.red_attack_damage = d[0]; s.blue_attack_damage = d[1];
+    s.red_remaining_hp = h[0]; s.blue_remaining_hp = h[1];
+    s.control_zone_owner = match_->owner() < 0 ? "" : match_->owner() == 0 ? "red" : "blue";
+    s.eligible_robots = match_->eligible(); s.result = match_->result();
+    s.end_reason = match_->reason(); s.error_message = match_->error(); info_publisher_->publish(s);
+    Status status; status.state = s.state; status.elapsed_seconds = s.elapsed_seconds;
+    status_publisher_->publish(status);
+    for (const auto & item : match_->referee().robots()) {
+      const auto & r = item.second; RobotStatus msg; msg.header.stamp = s.header.stamp;
+      msg.robot_name = item.first; msg.max_hp = r.config.max_hp; msg.current_hp = r.current_hp;
+      msg.shooter_heat = r.heat; msg.heat_limit = r.config.heat_limit; msg.cooling_rate = r.config.cooling_rate;
+      msg.shots_last_period = r.shots_last_period; msg.total_shots = r.total_shots; msg.total_hits = r.total_hits;
+      msg.alive = r.alive; msg.shooter_overheated = r.overheated; msg.shooter_permanently_locked = r.permanently_locked;
+      msg.invincible = r.invincible; msg.weakened = r.weakened; msg.death_count = r.death_count;
+      const double ns_to_s = 1e-9;
+      msg.revive_remaining_seconds = r.alive ? 0.0 :
+        std::max(0.0, static_cast<double>(r.revive_ready_ns - last_stamp_) * ns_to_s);
+      msg.invincible_remaining_seconds = r.invincible ?
+        std::max(0.0, static_cast<double>(r.invincible_until_ns - last_stamp_) * ns_to_s) : 0.0;
+      publishers_.at(item.first)->publish(msg);
+    }
+  }
+  std::unique_ptr<MatchEngine> match_;
+  rclcpp::Client<SimulationControl>::SharedPtr simulation_client_;
+  rclcpp::Subscription<SimulationFrame>::SharedPtr frame_sub_;
+  int64_t simulation_request_id_{0};
+  std::mutex mutex_;
+  std::deque<SimulationFrame> frames_;
+  bool overflow_{false}, configured_{false}, base_value_{false};
+  Stage stage_{Stage::IDLE};
+  uint64_t serial_{0}, token_{0}, control_epoch_{0};
+  int64_t stage_since_{0}, last_send_{0}, last_stamp_{0}, last_frame_wall_{0};
+  SimulationControl::Request::SharedPtr simulation_command_;
+  std::vector<std::string> robot_names_;
+  std::map<std::string, rclcpp::Publisher<RobotStatus>::SharedPtr> publishers_;
+  rclcpp::Publisher<Info>::SharedPtr info_publisher_;
+  rclcpp::Publisher<Status>::SharedPtr status_publisher_;
+  rclcpp::Service<Control>::SharedPtr service_;
+  std::map<std::string, rclcpp::Client<Enable>::SharedPtr> enables_;
+  std::map<std::string, rclcpp::Client<Reset>::SharedPtr> resets_;
+  std::map<std::string, rclcpp::Client<Initialize>::SharedPtr> odometry_initializers_;
+  std::map<std::string, uint8_t> colors_;
+  std::map<std::string, Pending> pending_;
+  std::map<std::string, Pending> initialize_pending_;
+  std::map<std::pair<std::string, uint8_t>, Desired> desired_;
+  rclcpp::TimerBase::SharedPtr timer_, status_timer_;
+};
+}
+int main(int argc, char ** argv)
+{
+  rclcpp::init(argc, argv);
+  try {rclcpp::spin(std::make_shared<recruitment_sim_referee_system::RefereeSystemNode>());}
+  catch (const std::exception & e) {
+    RCLCPP_FATAL(rclcpp::get_logger("referee_system"), "%s", e.what()); rclcpp::shutdown(); return 1;
+  }
+  rclcpp::shutdown(); return 0;
+}

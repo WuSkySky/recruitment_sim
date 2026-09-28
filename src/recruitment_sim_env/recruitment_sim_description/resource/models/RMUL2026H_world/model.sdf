@@ -1,0 +1,181 @@
+<?xml version="1.0"?>
+<!--
+  Adapted from ROS2_RM_Navigation/pb_rm_simulation.
+  Copyright (c) 2026 MY_nav Contributors. Licensed under the MIT License.
+-->
+<sdf version="1.7">
+  <model name="RMUL_2026">
+    <static>true</static>
+    <link name="field">
+      <!-- Colors sampled from figures 3-1 through 3-8 of the 2026 RMUL rules.
+           Values below are linear-RGB compensated for Classic Ogre so their final
+           on-screen sRGB appearance matches the rulebook artwork. -->
+      <visual name="field_ground_visual">
+        <geometry>
+          <mesh>
+            <uri>model://RMUL2026H_world/meshes/RMUL_2026H_ground_visual.stl</uri>
+          </mesh>
+        </geometry>
+        <material>
+          <ambient>0.505 0.505 0.505 1</ambient>
+          <diffuse>0.505 0.505 0.505 1</diffuse>
+          <specular>0.01 0.01 0.01 1</specular>
+        </material>
+        <cast_shadows>true</cast_shadows>
+      </visual>
+
+      <visual name="field_walls_visual">
+        <geometry>
+          <mesh>
+            <!-- Wall faces point inward, so they are culled from outside. -->
+            <uri>model://RMUL2026H_world/meshes/RMUL_2026H_walls_visual.stl</uri>
+          </mesh>
+        </geometry>
+        <material>
+          <ambient>0.169 0.169 0.169 1</ambient>
+          <diffuse>0.169 0.169 0.169 1</diffuse>
+          <specular>0.01 0.01 0.01 1</specular>
+        </material>
+        <cast_shadows>true</cast_shadows>
+      </visual>
+
+      <visual name="highlands_visual">
+        <geometry>
+          <mesh>
+            <uri>model://RMUL2026H_world/meshes/RMUL_2026H_highlands_visual.stl</uri>
+          </mesh>
+        </geometry>
+        <material>
+          <ambient>0.348 0.408 0.492 1</ambient>
+          <diffuse>0.348 0.408 0.492 1</diffuse>
+          <specular>0.01 0.01 0.01 1</specular>
+        </material>
+        <cast_shadows>true</cast_shadows>
+      </visual>
+
+      <!-- The start / supply zones are 1.5 x 2.0 m and point-symmetric. -->
+      <visual name="red_start_supply_zone_visual">
+        <pose>-5.25 3.0 0.002 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>1.5 2.0 0.004</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.201 0.201 0.201 1</ambient>
+          <diffuse>0.201 0.201 0.201 1</diffuse>
+          <specular>0.01 0.01 0.01 1</specular>
+        </material>
+        <cast_shadows>false</cast_shadows>
+      </visual>
+
+      <visual name="blue_start_supply_zone_visual">
+        <pose>5.25 -3.0 0.002 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>1.5 2.0 0.004</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.201 0.201 0.201 1</ambient>
+          <diffuse>0.201 0.201 0.201 1</diffuse>
+          <specular>0.01 0.01 0.01 1</specular>
+        </material>
+        <cast_shadows>false</cast_shadows>
+      </visual>
+
+      <!-- The central control zone is 3.0 x 3.0 m. -->
+      <visual name="control_zone_visual">
+        <pose>0 0 0.002 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>3.0 3.0 0.004</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.309 0.486 0.627 1</ambient>
+          <diffuse>0.309 0.486 0.627 1</diffuse>
+          <specular>0.01 0.01 0.01 1</specular>
+        </material>
+        <cast_shadows>false</cast_shadows>
+      </visual>
+      <collision name="collision">
+        <max_contacts>10</max_contacts>
+        <geometry>
+          <mesh>
+            <uri>model://RMUL2026H_world/meshes/RMUL_2026H.stl</uri>
+          </mesh>
+        </geometry>
+        <surface>
+          <friction>
+            <ode>
+              <mu>1</mu>
+              <mu2>1</mu2>
+            </ode>
+          </friction>
+          <contact>
+            <collide_bitmask>1</collide_bitmask>
+            <ode>
+              <soft_cfm>0</soft_cfm>
+              <soft_erp>0.2</soft_erp>
+              <kp>1e13</kp>
+              <kd>1</kd>
+              <max_vel>0.01</max_vel>
+            </ode>
+          </contact>
+        </surface>
+      </collision>
+
+      <!--
+        Each highland is 2.0 x 5.0 x 0.2 m. The corrected mesh contains the
+        platform bodies; these two boxes add the 0.15 x 1.8 x 0.2 m guard
+        strips shown in the field drawing. Their bottom faces sit at z=0.2 m.
+      -->
+      <visual name="positive_highland_guard_visual">
+        <pose>1.575 -0.8 0.3 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.15 1.8 0.2</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.348 0.408 0.492 1</ambient>
+          <diffuse>0.348 0.408 0.492 1</diffuse>
+          <specular>0.01 0.01 0.01 1</specular>
+        </material>
+        <cast_shadows>true</cast_shadows>
+      </visual>
+      <collision name="positive_highland_guard_collision">
+        <pose>1.575 -0.8 0.3 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.15 1.8 0.2</size>
+          </box>
+        </geometry>
+      </collision>
+
+      <visual name="negative_highland_guard_visual">
+        <pose>-1.575 0.8 0.3 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.15 1.8 0.2</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.348 0.408 0.492 1</ambient>
+          <diffuse>0.348 0.408 0.492 1</diffuse>
+          <specular>0.01 0.01 0.01 1</specular>
+        </material>
+        <cast_shadows>true</cast_shadows>
+      </visual>
+      <collision name="negative_highland_guard_collision">
+        <pose>-1.575 0.8 0.3 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.15 1.8 0.2</size>
+          </box>
+        </geometry>
+      </collision>
+    </link>
+  </model>
+</sdf>
